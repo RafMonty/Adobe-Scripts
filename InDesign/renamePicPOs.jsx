@@ -8,8 +8,8 @@
     // ─────────────────────────────
     // Regex: matches filenames like pic1.pdf, pic12.pdf (case-insensitive)
     // ─────────────────────────────
-    var pattern = /^pic(\d+)\.pdf$/i;
-
+    var pattern = /^(\d+)\.pdf$/i;
+// var pattern = /^pic(\d+)\.pdf$/i;
     var renamed  = [];
     var skipped  = [];
 
