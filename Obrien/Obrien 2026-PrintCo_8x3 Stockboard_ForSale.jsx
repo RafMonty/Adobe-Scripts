@@ -33,9 +33,10 @@ Artwork.SetTextBoxContents("URL", "");
 // };
 
 
-//\\//\\//\\//\\//\\//\\//\\//
-//     SIGNBOARD  STYLE     \\
-//\\//\\//\\//\\//\\//\\//\\//
+//\\//\\//\\//\\//\\//\\//\\//\\//
+//     SIGNBOARD  STYLE         \\
+// {"options" :"Linen,Forest"}  \\
+//\\//\\//\\//\\//\\//\\//\\//\\//
 
 // FOREST
 if (Artwork.pv("AC_MultiuseDropdown") === "Forest") {
