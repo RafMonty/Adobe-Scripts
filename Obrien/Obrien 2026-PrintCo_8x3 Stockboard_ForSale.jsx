@@ -1,11 +1,10 @@
 //\\//\\//\\//\\//\\//\\//\\//\\//\\//\\//\\///\\//\\//\\//\\//\\//
 //   Hard coded Leaese Stockboard                                \\
 //   Obrien 2026-PrintCo_8x3 Stockboard_P                        \\
-\\ Form: Obrien 2026 - PrintCo Stockboard (8x3) No SaleM         \\
+// Form: Obrien 2026 - PrintCo Stockboard (8x3) No SaleM         \\
 //\\//\\//\\//\\//\\//\\//\\//\\//\\//\\//\\///\\//\\//\\//\\//\\//
 
 
-Obrien 2026-PrintCo_8x3 Stockboard_P
 var agent1 = "";
 var agent2 = "";
 var salemethod = "";
