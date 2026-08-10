@@ -7,7 +7,7 @@
 
 var agent1 = "";
 var agent2 = "";
-var salemethod = "";
+var salemethod = "For Sale";
 var name1Array = Artwork.pv("AC_AgentName1").split(" ");
 var a1FirstName = name1Array.slice(0, -1).join(" ");
 var a1LastName = name1Array[name1Array.length - 1];
@@ -32,10 +32,9 @@ Artwork.SetTextBoxContents("URL", "");
 // };
 
 
-//\\//\\//\\//\\//\\//\\//\\//\\//
-//     SIGNBOARD  STYLE         \\
-// {"options" :"Linen,Forest"}  \\
-//\\//\\//\\//\\//\\//\\//\\//\\//
+//\\//\\//\\//\\//\\//\\//\\//
+//     SIGNBOARD  STYLE     \\
+//\\//\\//\\//\\//\\//\\//\\//
 
 // FOREST
 if (Artwork.pv("AC_MultiuseDropdown") === "Forest") {
@@ -72,14 +71,14 @@ if (Artwork.pv("AC_WebURL") !== "") {
 //     salemethod += "[SaleMethodMoss]" + saleTypeLabels[saleType];
 //     Artwork.SetTextBoxContents("SaleMethod", salemethod);
 // }
-   salemethod += "[SaleMethodMoss]For<SCR>Sale";
-   Artwork.SetTextBoxContents("SaleMethod", salemethod);
+ 
+   Artwork.SetTextBoxContents("SaleMethod", "[SaleMethodMoss]For<SCR>Sale");
 
 //\\//\\//\\//\\//\\//\\//\\//
 //      Agent Details       \\
 //\\//\\//\\//\\//\\//\\//\\//
 if (Artwork.pv("AC_AgentName1") !== "") {
-    if (Artwork.pv("AC_AgentName1").length <= 20 || Artwork.pv("AC_CopySix") === "" || Artwork.pv("AC_MultiuseDropdown2") === "For Lease") {
+    if (Artwork.pv("AC_AgentName1").length <= 20 || Artwork.pv("AC_CopySix") === "" || salemethod !== "For Sale") {
         agent1 += "[TextReg" + textcol + "]" + Artwork.pv("AC_AgentName1") + "<SCR>";
     } else {
         agent1 += "[TextReg" + textcol + "]" + a1FirstName  + "<SCR>";
@@ -89,7 +88,7 @@ if (Artwork.pv("AC_AgentName1") !== "") {
     agent1 += "[TextReg" + textcol + "]" + Artwork.pv("AC_AgentPhone1");
     
     if (Artwork.pv("AC_AgentName2") !== "") {
-        if (Artwork.pv("AC_AgentName2").length <= 20 || Artwork.pv("AC_CopySix") === "" || Artwork.pv("AC_MultiuseDropdown2") === "For Lease") {
+        if (Artwork.pv("AC_AgentName2").length <= 20 || Artwork.pv("AC_CopySix") === "" || salemethod !== "For Sale") {
             agent2 += "[TextReg" + textcol + "]" + Artwork.pv("AC_AgentName2") + "<SCR>";
         } else {
             agent2 += "[TextReg" + textcol + "]" + a2FirstName  + "<SCR>";
@@ -102,7 +101,7 @@ if (Artwork.pv("AC_AgentName1") !== "") {
 }
 
 
-if (Artwork.pv("AC_MultiuseDropdown2") === "For Sale" && Artwork.pv("AC_CopySix") !== "") {
+if (salemethod === "For Sale" && Artwork.pv("AC_CopySix") !== "") {
     Artwork.SetImagePOSourceImageByQueueAndName("AHS1", -2146768183, Artwork.pvf("AC_AgentName1", "cleanText") + "_Round.png");
     Artwork.SetImagePOSourceImageByQueueAndName("AHS2", -2146768183, Artwork.pvf("AC_AgentName2", "cleanText") + "_Round.png");
     Artwork.SetTextBoxContents("Agent1Info", agent1);
