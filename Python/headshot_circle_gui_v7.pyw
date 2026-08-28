@@ -17,6 +17,11 @@ New in v7:
       originals are moved to processed\\ (or failed\\).  Reference and
       backgrounds paths in the settings file may be relative to the
       folder, so watched folders stay portable.
+    * Drop targets      — a tab of named drop tiles.  Each tile links a
+      settings preset (.json, re-read at every drop) to a required output
+      folder.  Drop files/folders on a tile and they process with that
+      preset — previews stay off for speed, and the tile shows its own
+      progress bar.
     * Jobs queue up: drops and watch events wait politely behind any
       batch that is already running.
 
@@ -827,6 +832,144 @@ class PreviewWindow(tk.Toplevel):
             self.deiconify()
 
 
+TILE_COLOURS = ("#dbeafe", "#dcfce7", "#fef9c3", "#fde2e2",
+                "#ede9fe", "#cffafe")
+
+
+def shorten_path(text, limit=42):
+    return text if len(text) <= limit else "…" + text[-(limit - 1):]
+
+
+class DropTile(tk.Frame):
+    """A named drop zone bound to a preset file and an output folder."""
+
+    def __init__(self, master, target, colour, on_remove, on_drop):
+        super().__init__(master, bd=2, relief="ridge", bg=colour)
+        self.target = target
+        top = tk.Frame(self, bg=colour)
+        top.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(top, text=target["name"], bg=colour,
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        tk.Button(top, text="✕", bg=colour, relief="flat", bd=0,
+                  command=on_remove).pack(side="right")
+        tk.Label(self, text=f"preset: {Path(target['preset']).name}",
+                 bg=colour, fg="#555555").pack(anchor="w", padx=8)
+        tk.Label(self, text="→ " + shorten_path(target["output"]),
+                 bg=colour, fg="#555555").pack(anchor="w", padx=8)
+        self.bar = ttk.Progressbar(self, mode="determinate")
+        self.bar.pack(fill="x", padx=8, pady=(4, 8))
+        if HAS_DND:
+            handler = lambda e: on_drop(target, e)
+            for w in self._all_widgets():
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", handler)
+
+    def _all_widgets(self):
+        stack, out = [self], []
+        while stack:
+            w = stack.pop()
+            out.append(w)
+            stack.extend(w.winfo_children())
+        return out
+
+    def set_progress(self, i, total):
+        self.bar["maximum"] = total
+        self.bar["value"] = i
+
+    def reset_progress(self):
+        self.bar["value"] = 0
+
+
+class TargetDialog(tk.Toplevel):
+    """Modal dialog to create a drop target — every field is required."""
+
+    def __init__(self, master, existing_names):
+        super().__init__(master)
+        self.title("New drop target")
+        self.resizable(False, False)
+        self.result = None
+        self.existing = existing_names
+        pad = {"padx": 8, "pady": 4}
+
+        self.var_name = tk.StringVar()
+        self.var_preset = tk.StringVar()
+        self.var_out = tk.StringVar()
+
+        ttk.Label(self, text="Name:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(self, textvariable=self.var_name,
+                  width=34).grid(row=0, column=1, sticky="ew", **pad)
+
+        ttk.Label(self, text="Preset file:").grid(row=1, column=0,
+                                                  sticky="w", **pad)
+        ttk.Entry(self, textvariable=self.var_preset,
+                  width=34).grid(row=1, column=1, sticky="ew", **pad)
+        ttk.Button(self, text="Browse…",
+                   command=self._pick_preset).grid(row=1, column=2, **pad)
+
+        ttk.Label(self, text="Output folder:").grid(row=2, column=0,
+                                                    sticky="w", **pad)
+        ttk.Entry(self, textvariable=self.var_out,
+                  width=34).grid(row=2, column=1, sticky="ew", **pad)
+        ttk.Button(self, text="Browse…",
+                   command=self._pick_out).grid(row=2, column=2, **pad)
+
+        btns = ttk.Frame(self)
+        btns.grid(row=3, column=0, columnspan=3, pady=(8, 8))
+        ttk.Button(btns, text="Create", command=self._ok).pack(side="left",
+                                                               padx=4)
+        ttk.Button(btns, text="Cancel",
+                   command=self.destroy).pack(side="left", padx=4)
+        self.grab_set()
+        self.transient(master)
+
+    def _pick_preset(self):
+        f = filedialog.askopenfilename(
+            parent=self, title="Select settings preset",
+            filetypes=[("JSON settings", "*.json"), ("All files", "*.*")])
+        if f:
+            self.var_preset.set(f)
+
+    def _pick_out(self):
+        d = filedialog.askdirectory(parent=self, title="Select output folder")
+        if d:
+            self.var_out.set(d)
+
+    def _ok(self):
+        name = self.var_name.get().strip()
+        preset = self.var_preset.get().strip()
+        out = self.var_out.get().strip()
+        if not name:
+            messagebox.showerror("Name required",
+                                 "Give the target a name.", parent=self)
+            return
+        if name in self.existing:
+            messagebox.showerror("Duplicate name",
+                                 "A target with that name already exists.",
+                                 parent=self)
+            return
+        if not preset or not Path(preset).is_file():
+            messagebox.showerror("Preset required",
+                                 "Select an existing settings preset file "
+                                 "(save one from the Batch tab first).",
+                                 parent=self)
+            return
+        try:
+            load_settings_file(preset)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Bad preset",
+                                 f"That file is not a valid settings "
+                                 f"preset:\n{e}", parent=self)
+            return
+        if not out or not Path(out).is_dir():
+            messagebox.showerror("Output folder required",
+                                 "Select an existing output folder — a drop "
+                                 "target cannot be created without one.",
+                                 parent=self)
+            return
+        self.result = {"name": name, "preset": preset, "output": out}
+        self.destroy()
+
+
 class App(BaseTk):
     def __init__(self):
         super().__init__()
@@ -858,8 +1001,15 @@ class App(BaseTk):
         nb.add(frm, text="Batch")
         frm.columnconfigure(1, weight=1)
 
+        targets_tab = ttk.Frame(nb)
+        nb.add(targets_tab, text="Drop targets")
+
         watch_tab = ttk.Frame(nb)
         nb.add(watch_tab, text="Watched folders")
+
+        # Drop-target state
+        self.drop_targets = []      # [{name, preset, output}, ...]
+        self.tiles = {}             # name -> DropTile
 
         self.var_input = tk.StringVar()
         self.var_output = tk.StringVar()
@@ -1007,6 +1157,27 @@ class App(BaseTk):
         self.btn_run.grid(row=11, column=0, columnspan=3, sticky="ew",
                           padx=8, pady=(8, 8))
 
+        # ---- Drop targets tab --------------------------------------------
+        dnd_state = ("Drop files or folders on a tile to process them with "
+                     "its preset (previews off for speed)."
+                     if HAS_DND else
+                     "pip install tkinterdnd2 to enable drop targets.")
+        ttk.Label(
+            targets_tab, justify="left",
+            text=(f"{dnd_state}\nEach target links a settings preset "
+                  "(re-read at every drop) to a required output folder."),
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        self.tiles_frame = ttk.Frame(targets_tab)
+        self.tiles_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        self.tiles_frame.columnconfigure(0, weight=1)
+        self.tiles_frame.columnconfigure(1, weight=1)
+
+        tbtns = ttk.Frame(targets_tab)
+        tbtns.pack(fill="x", padx=8, pady=(4, 8))
+        ttk.Button(tbtns, text="Add target…",
+                   command=self.add_drop_target).pack(side="left")
+
         # ---- Watched folders tab -----------------------------------------
         ttk.Label(
             watch_tab, justify="left",
@@ -1148,6 +1319,10 @@ class App(BaseTk):
                     i, total = payload
                     self.prog["maximum"] = total
                     self.prog["value"] = i
+                    tile = self.tiles.get(
+                        (self.current_job or {}).get("target_name"))
+                    if tile is not None:
+                        tile.set_progress(i, total)
                 elif kind == "preview":
                     self.show_preview(*payload)
                 elif kind == "done":
@@ -1155,6 +1330,9 @@ class App(BaseTk):
                     job = self.current_job or {}
                     for f in job.get("files") or []:
                         self.watch_inflight.discard(str(f))
+                    tile = self.tiles.get(job.get("target_name"))
+                    if tile is not None:
+                        tile.reset_progress()
                     self.current_job = None
                     self.busy = False
                     if not self.jobs:
@@ -1383,11 +1561,22 @@ class App(BaseTk):
         for folder in raw.get("watched_folders", []):
             if isinstance(folder, str) and Path(folder).is_dir():
                 self.lst_watch.insert("end", folder)
+        for t in raw.get("drop_targets", []):
+            if (isinstance(t, dict)
+                    and all(isinstance(t.get(k), str) and t.get(k)
+                            for k in ("name", "preset", "output"))
+                    and t["name"] not in (x["name"]
+                                          for x in self.drop_targets)):
+                self.drop_targets.append(
+                    {k: t[k] for k in ("name", "preset", "output")})
+        if self.drop_targets:
+            self._rebuild_tiles()
 
     def on_close(self):
         try:
             sd = self.collect_settings()
             sd["watched_folders"] = list(self.lst_watch.get(0, "end"))
+            sd["drop_targets"] = self.drop_targets
             with open(self._last_settings_path(), "w", encoding="utf-8") as fh:
                 json.dump(sd, fh, indent=2)
         except OSError:
@@ -1397,22 +1586,79 @@ class App(BaseTk):
     # ------------------------------------------------------------------
     # Drag & drop
     # ------------------------------------------------------------------
-    def on_drop(self, event):
-        paths = [Path(p) for p in self.tk.splitlist(event.data)]
+    def _files_from_drop(self, data):
         files = []
-        for p in paths:
+        # Tcl splitlist treats backslashes as escapes; tkdnd normally
+        # sends forward slashes, but normalise so both survive.
+        data = str(data).replace("\\", "/")
+        for p in (Path(p) for p in self.tk.splitlist(data)):
             if p.is_dir():
                 files.extend(sorted(
                     f for f in p.iterdir()
                     if f.suffix.lower() in VALID_EXT and f.is_file()))
             elif p.is_file() and p.suffix.lower() in VALID_EXT:
                 files.append(p)
+        return files
+
+    def on_drop(self, event):
+        files = self._files_from_drop(event.data)
         if not files:
             self.log("Drop ignored — no image files found.")
             return
         self.log(f"Dropped {len(files)} image(s) — processing with "
                  "current settings.")
         self.start(files=files, quiet=True)
+
+    # ------------------------------------------------------------------
+    # Drop targets
+    # ------------------------------------------------------------------
+    def add_drop_target(self):
+        dlg = TargetDialog(self, [t["name"] for t in self.drop_targets])
+        self.wait_window(dlg)
+        if dlg.result:
+            self.drop_targets.append(dlg.result)
+            self._rebuild_tiles()
+            self.log(f"Drop target '{dlg.result['name']}' created "
+                     f"-> {dlg.result['output']}")
+
+    def _remove_drop_target(self, target):
+        self.drop_targets = [t for t in self.drop_targets if t is not target]
+        self._rebuild_tiles()
+
+    def _rebuild_tiles(self):
+        for w in self.tiles_frame.winfo_children():
+            w.destroy()
+        self.tiles = {}
+        for i, target in enumerate(self.drop_targets):
+            tile = DropTile(
+                self.tiles_frame, target,
+                TILE_COLOURS[i % len(TILE_COLOURS)],
+                on_remove=lambda t=target: self._remove_drop_target(t),
+                on_drop=self.on_target_drop,
+            )
+            tile.grid(row=i // 2, column=i % 2, sticky="ew", padx=4, pady=4)
+            self.tiles[target["name"]] = tile
+
+    def on_target_drop(self, target, event):
+        files = self._files_from_drop(event.data)
+        if not files:
+            self.log(f"[{target['name']}] drop ignored — no image files.")
+            return
+        try:
+            sd = load_settings_file(target["preset"])
+        except (OSError, json.JSONDecodeError) as e:
+            self.log(f"[{target['name']}] preset unreadable "
+                     f"({target['preset']}): {e}")
+            return
+        cfg = settings_to_cfg(sd, Path(target["preset"]).parent, "", self.log)
+        cfg["input"] = None
+        cfg["output"] = target["output"]
+        cfg["files"] = [str(f) for f in files]
+        cfg["preview"] = False      # drop targets are for speed — no preview
+        cfg["quiet"] = True
+        cfg["target_name"] = target["name"]
+        self.log(f"[{target['name']}] {len(files)} image(s) dropped.")
+        self.enqueue_job(cfg, f"drop target '{target['name']}'")
 
     # ------------------------------------------------------------------
     # Watched folders
