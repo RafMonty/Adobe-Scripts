@@ -436,6 +436,7 @@ DEFAULT_SETTINGS = {
     "fill_colour": "#ffffff",
     "stable_bg": True,
     "center_x": True,
+    "circle": True,
     "scale_mode": SCALE_MODES[0],
     "match_ref": False,
     "preview": True,
@@ -553,6 +554,7 @@ def settings_to_cfg(sd, base_dir, folder, log):
         "backgrounds": bgdir,
         "stable_bg": sd["stable_bg"],
         "center_x": sd["center_x"],
+        "circle": sd["circle"],
         "scale_mode": sd["scale_mode"],
         "match_ref": sd["match_ref"] and bool(ref),
         "preview": sd["preview"],
@@ -660,9 +662,12 @@ def run_batch(cfg, log, progress, done, preview):
             target_eye_xy = (canvas_w / 2.0, target_eye_xy[1])
             log("Horizontal centring ON — eye midpoint forced to canvas centre.")
 
-        use_circle = canvas_w == canvas_h
+        want_circle = cfg.get("circle", True)
+        use_circle = want_circle and canvas_w == canvas_h
         mask = circle_mask(canvas_w) if use_circle else None
-        if not use_circle:
+        if not want_circle:
+            log("Circular crop OFF — full-frame output.")
+        elif not use_circle:
             log("Output is not square — circular crop disabled.")
 
         if show_preview and ref_img is not None:
@@ -1129,10 +1134,18 @@ class App(BaseTk):
                                       state="disabled")
         self.spn_jpeg_q.grid(row=4, column=4, sticky="w", **pad)
 
+        self.var_circle = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts,
+            text="Circular crop — transparent outside the circle "
+                 "(square outputs only)",
+            variable=self.var_circle,
+        ).grid(row=5, column=0, columnspan=6, sticky="w", **pad)
+
         self.var_preview = tk.BooleanVar(value=True)
         self.var_marks = tk.BooleanVar(value=True)
         prev_row = ttk.Frame(opts)
-        prev_row.grid(row=5, column=0, columnspan=6, sticky="w", **pad)
+        prev_row.grid(row=6, column=0, columnspan=6, sticky="w", **pad)
         ttk.Checkbutton(prev_row, text="Live preview",
                         variable=self.var_preview).pack(side="left")
         ttk.Checkbutton(prev_row,
@@ -1447,6 +1460,7 @@ class App(BaseTk):
             "backgrounds": bgdir or None,
             "stable_bg": self.var_stable.get(),
             "center_x": self.var_center_x.get(),
+            "circle": self.var_circle.get(),
             "scale_mode": self.var_scale_mode.get(),
             "match_ref": self.var_match.get(),
             "preview": self.var_preview.get(),
@@ -1473,6 +1487,7 @@ class App(BaseTk):
             "fill_colour": colour_to_hex(self.bg_colour),
             "stable_bg": self.var_stable.get(),
             "center_x": self.var_center_x.get(),
+            "circle": self.var_circle.get(),
             "scale_mode": self.var_scale_mode.get(),
             "match_ref": self.var_match.get(),
             "preview": self.var_preview.get(),
@@ -1504,6 +1519,7 @@ class App(BaseTk):
         self.btn_colour.configure(bg=colour_to_hex(self.bg_colour))
         self.var_stable.set(sd["stable_bg"])
         self.var_center_x.set(sd["center_x"])
+        self.var_circle.set(sd["circle"])
         self.var_scale_mode.set(sd["scale_mode"])
         self.var_match.set(sd["match_ref"])
         self.var_preview.set(sd["preview"])
