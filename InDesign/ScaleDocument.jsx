@@ -23,6 +23,8 @@
           FIX: the table-style pass skipped index 0, which is [Basic
           Table] (a real, usable style). Placeholder styles ([None],
           [No Paragraph Style]) are now skipped by NAME.
+          A progress palette shows the current phase, a detail line and
+          a bar while the script runs, so InDesign no longer looks hung.
 
    v1.1 — Rebuilt the placement engine. v1 scaled items around a fixed
           pasteboard anchor and assumed the page stayed put through
@@ -109,6 +111,56 @@
         { name: "in", pt: 72 },
         { name: "pt", pt: 1 }
     ];
+
+    // ---------------------------------------------------------------------
+    // Progress palette (non-modal). phase() sets the overall band of the
+    // bar for the current stage; step(frac, detail) moves within that band.
+    // Every call is wrapped so a UI hiccup can never abort the run.
+    // ---------------------------------------------------------------------
+    var PROG = (function () {
+        var win = null, bar = null, stPhase = null, stDetail = null;
+        var base = 0, span = 0;
+        function safe(f) { try { f(); } catch (e) {} }
+        return {
+            open: function () {
+                safe(function () {
+                    win = new Window("palette", "Scale Artwork Document", undefined, { closeButton: false });
+                    win.orientation = "column";
+                    win.alignChildren = "fill";
+                    win.margins = 15;
+                    stPhase = win.add("statictext", undefined, "Starting...");
+                    stPhase.characters = 72;
+                    bar = win.add("progressbar", undefined, 0, 100);
+                    bar.preferredSize = [480, 14];
+                    stDetail = win.add("statictext", undefined, " ", { truncate: "middle" });
+                    stDetail.characters = 72;
+                    win.show();
+                    win.update();
+                });
+            },
+            phase: function (from, to, label) {
+                base = from; span = to - from;
+                safe(function () {
+                    stPhase.text = label;
+                    stDetail.text = " ";
+                    bar.value = from;
+                    win.update();
+                });
+            },
+            step: function (frac, detail) {
+                safe(function () {
+                    if (frac < 0) frac = 0;
+                    if (frac > 1) frac = 1;
+                    bar.value = base + span * frac;
+                    if (detail !== undefined) stDetail.text = detail;
+                    win.update();
+                });
+            },
+            close: function () {
+                safe(function () { if (win) win.close(); win = null; });
+            }
+        };
+    })();
 
     // ---------------------------------------------------------------------
     // Small helpers (function declarations are hoisted, so these are usable
@@ -718,6 +770,7 @@
         try { stories = doc.stories.everyItem().getElements(); } catch (e) {}
         for (i = 0; i < stories.length; i++) {
             var st = stories[i];
+            PROG.step(0.8 * i / stories.length, "Story " + (i + 1) + " of " + stories.length);
             try { add(st.paragraphs.everyItem().getElements(), st.paragraphs.everyItem(), LIVE_PARA_PROPS); } catch (e) {}
             try { add(st.textStyleRanges.everyItem().getElements(), st.textStyleRanges.everyItem(), LIVE_CHAR_PROPS); } catch (e) {}
 
@@ -741,6 +794,7 @@
         }
 
         // ---- page items: text frame prefs, frame baseline grids, anchored offsets ----
+        PROG.step(0.85, "Text frames and anchored objects...");
         var items = [];
         try { items = doc.allPageItems; } catch (e) {}
         if (cfg.doParents) {
@@ -771,6 +825,10 @@
     function applyLiveFixes(entries, s) {
         var counts = { fixed: 0, ok: 0, other: 0, failed: 0 };
         for (var i = 0; i < entries.length; i++) {
+            if (i % 5 === 0) {
+                PROG.step(i / entries.length, "Checking group " + (i + 1) + " of " + entries.length +
+                          "  (corrected so far: " + counts.fixed + ")");
+            }
             try { verifySnap(entries[i], s, counts); } catch (e) {}
         }
         return counts;
@@ -798,9 +856,15 @@
                             CoordinateSpaces.PASTEBOARD_COORDINATES)[0];
     }
 
+    function spreadProg(report, f, text) {
+        // Progress within this spread's slice of the bar
+        PROG.step(report.pf0 + (report.pf1 - report.pf0) * f, report.label + " — " + text);
+    }
+
     function processSpread(spread, s, bleedPt, cfg, report) {
         var pages = spread.pages, i, k;
         var oldRules = [];
+        if (!report.label) { report.label = "Spread"; report.pf0 = 0; report.pf1 = 1; }
 
         // Liquid Layout off so nothing "adjusts" behind our back
         for (i = 0; i < pages.length; i++) {
@@ -825,8 +889,12 @@
         }
 
         // ---- 1. Scale each item in place, about its own centre ----
+        spreadProg(report, 0, "scaling " + items.length + " item(s)");
         if (s !== 1) {
             for (i = 0; i < items.length; i++) {
+                if (i % 25 === 0 && i > 0) {
+                    spreadProg(report, 0.45 * i / items.length, "scaling item " + i + " of " + items.length);
+                }
                 try {
                     items[i].transform(
                         CoordinateSpaces.PASTEBOARD_COORDINATES,
@@ -838,6 +906,7 @@
         }
 
         // ---- 2. Scale the pages themselves ----
+        spreadProg(report, 0.45, "resizing page(s)" + (bleedPt > 0 ? " and adding bleed" : ""));
         if (s !== 1) {
             for (i = 0; i < pages.length; i++) {
                 pages[i].resize(
@@ -908,7 +977,11 @@
         var trimX = N[0] + bleedPt;            // trim top-left now
         var trimY = N[1] + bleedPt;
 
+        spreadProg(report, 0.55, "placing " + items.length + " item(s)");
         for (i = 0; i < items.length; i++) {
+            if (i % 25 === 0 && i > 0) {
+                spreadProg(report, 0.55 + 0.45 * i / items.length, "placing item " + i + " of " + items.length);
+            }
             if (!offs[i]) continue;
             var tgtX = trimX + s * offs[i][0];
             var tgtY = trimY + s * offs[i][1];
@@ -957,6 +1030,8 @@
         var b0, refPage;
 
         try {
+            PROG.phase(0, 3, "Preparing: setting preferences, unlocking layers and items...");
+
             // ------- save & set app/doc prefs -------
             savedPrefs.measurementUnit = app.scriptPreferences.measurementUnit;
             app.scriptPreferences.measurementUnit = MeasurementUnits.POINTS;
@@ -1005,22 +1080,33 @@
             // ------- live snapshot (before anything moves; units are points) -------
             var live = null;
             if (cfg.doLiveFix && s !== 1) {
+                PROG.phase(3, 18, "Recording live text, frame and table values (before scaling)...");
                 try { live = takeLiveSnapshot(doc, cfg); }
                 catch (e) { live = null; summary.push("Live verify skipped (snapshot failed: " + e + ")."); }
             }
 
             // ------- spreads -------
             var report = { maxResid: 0 };
-            for (i = 0; i < doc.spreads.length; i++) {
+            var nSp = doc.spreads.length;
+            PROG.phase(18, 55, "Scaling pages and artwork (" + nSp + " spread" + (nSp === 1 ? "" : "s") + ")...");
+            for (i = 0; i < nSp; i++) {
+                report.label = "Spread " + (i + 1) + " of " + nSp;
+                report.pf0 = i / nSp;
+                report.pf1 = (i + 1) / nSp;
                 processSpread(doc.spreads[i], s, bleedPt, cfg, report);
             }
-            summary.push(doc.spreads.length + " spread(s) scaled to " + fmt(cfg.pct) + "%.");
+            summary.push(nSp + " spread(s) scaled to " + fmt(cfg.pct) + "%.");
 
             if (cfg.doParents) {
-                for (i = 0; i < doc.masterSpreads.length; i++) {
+                var nMs = doc.masterSpreads.length;
+                PROG.phase(55, 60, "Scaling parent (master) spreads (" + nMs + ")...");
+                for (i = 0; i < nMs; i++) {
+                    report.label = "Parent spread " + (i + 1) + " of " + nMs;
+                    report.pf0 = i / nMs;
+                    report.pf1 = (i + 1) / nMs;
                     processSpread(doc.masterSpreads[i], s, bleedPt, cfg, report);
                 }
-                summary.push(doc.masterSpreads.length + " parent spread(s) scaled.");
+                summary.push(nMs + " parent spread(s) scaled.");
             }
 
             summary.push(report.maxResid <= 0.05
@@ -1035,12 +1121,18 @@
 
             // ------- style definitions -------
             if (cfg.doStyles && s !== 1) {
+                PROG.phase(60, 70, "Scaling style definitions...");
+                PROG.step(0.0, "Paragraph styles");
                 var nP = scaleStyleCollection(doc.allParagraphStyles, PARA_PROPS, s);
+                PROG.step(0.4, "Character styles");
                 var nC = scaleStyleCollection(doc.allCharacterStyles, TEXT_PROPS, s);
+                PROG.step(0.6, "Object styles");
                 var nO = scaleObjectStyles(doc, s);
+                PROG.step(0.8, "Table and cell styles");
                 var nT = 0, nCe = 0;
                 try { nT = scaleStyleCollection(doc.allTableStyles, TABLE_PROPS, s); } catch (e) {}
                 try { nCe = scaleStyleCollection(doc.allCellStyles, CELL_PROPS, s); } catch (e) {}
+                PROG.step(0.95, "Text defaults");
                 try { applyProps(doc.textDefaults, snapshotProps(doc.textDefaults, PARA_PROPS), s); } catch (e) {}
                 summary.push("Styles scaled — para: " + nP + ", char: " + nC +
                              ", object: " + nO + ", table: " + nT + ", cell: " + nCe + ".");
@@ -1048,12 +1140,14 @@
 
             // ------- custom stroke styles -------
             if (cfg.doStrokeStyles && s !== 1) {
+                PROG.phase(70, 72, "Scaling custom dashed / dotted stroke styles...");
                 var nS = scaleStrokeStyles(doc, s);
                 if (nS > 0) summary.push("Custom dashed/dotted stroke styles scaled: " + nS + ".");
             }
 
             // ------- live verify & fix -------
             if (live) {
+                PROG.phase(72, 88, "Verifying live text, frames and tables; fixing unscaled values...");
                 var lc = applyLiveFixes(live, s);
                 var msg = "Live text/table check: " + lc.fixed + " value(s) corrected, " +
                           lc.ok + " already scaled by InDesign.";
@@ -1064,6 +1158,7 @@
 
             // ------- grids -------
             if (cfg.doGrids && s !== 1) {
+                PROG.phase(88, 89, "Scaling baseline and document grids...");
                 try {
                     var gp = doc.gridPreferences;
                     if (isNum(gp.baselineDivision)) gp.baselineDivision = Math.max(0.1, gp.baselineDivision * s);
@@ -1076,6 +1171,7 @@
 
             // ------- effects fallback (older versions only) -------
             if (!effectsPrefOK && s !== 1) {
+                PROG.phase(89, 90, "Scaling effects manually (older InDesign)...");
                 var allIt = doc.allPageItems;
                 for (i = 0; i < allIt.length; i++) scaleEffectsOn(allIt[i], s);
                 if (cfg.doParents) {
@@ -1091,22 +1187,28 @@
 
             // ------- redefine scaling to 100% -------
             if (cfg.doRedefine) {
-                var bake = function (items) {
+                PROG.phase(90, 96, "Baking scaling to 100% (redefine scaling)...");
+                var bake = function (items, f0, f1) {
                     var n = 0;
                     for (var k = 0; k < items.length; k++) {
+                        if (k % 50 === 0) {
+                            PROG.step(f0 + (f1 - f0) * k / items.length, "Item " + k + " of " + items.length);
+                        }
                         if (isGraphicClass(items[k])) continue; // keep placed-image scale % meaningful
                         try { items[k].redefineScaling(); n++; } catch (e) {}
                     }
                     return n;
                 };
-                var baked = bake(doc.allPageItems);
+                var baked = bake(doc.allPageItems, 0, 0.8);
                 if (cfg.doParents) {
                     for (i = 0; i < doc.masterSpreads.length; i++) {
-                        try { baked += bake(doc.masterSpreads[i].allPageItems); } catch (e) {}
+                        try { baked += bake(doc.masterSpreads[i].allPageItems, 0.8, 1); } catch (e) {}
                     }
                 }
                 summary.push("Scaling baked to 100% on " + baked + " item(s).");
             }
+
+            PROG.phase(96, 99, "Finishing: bleed values, overset check, size report...");
 
             // ------- zero document bleed -------
             if (cfg.doZeroBleed) {
@@ -1145,6 +1247,8 @@
             }
 
         } finally {
+            PROG.phase(99, 100, "Restoring locks and preferences...");
+
             // ------- restore locks -------
             for (i = 0; i < lockedItems.length; i++) { try { lockedItems[i].locked = true; } catch (e) {} }
             for (i = 0; i < lockedLayers.length; i++) { try { lockedLayers[i].locked = true; } catch (e) {} }
@@ -1160,6 +1264,8 @@
             } catch (e) {}
             try { app.scriptPreferences.enableRedraw = savedPrefs.enableRedraw; } catch (e) {}
             try { app.scriptPreferences.measurementUnit = savedPrefs.measurementUnit; } catch (e) {}
+
+            PROG.close();
         }
 
         alert("Scale Artwork — done\n\n" + summary.join("\n"));
@@ -1185,12 +1291,16 @@
     }
 
     // Optionally run on a copy
+    if (cfg.onCopy && !doc.saved) {
+        alert("The document has never been saved, so a copy can't be created.\n" +
+              "Save it first, or untick 'Run on a copy'.");
+        return;
+    }
+
+    PROG.open();
+
     if (cfg.onCopy) {
-        if (!doc.saved) {
-            alert("The document has never been saved, so a copy can't be created.\n" +
-                  "Save it first, or untick 'Run on a copy'.");
-            return;
-        }
+        PROG.phase(0, 0, "Saving a copy of the document and opening it...");
         var f = doc.fullName;
         var base = f.fsName.replace(/\.indd$/i, "");
         var tag = fmt(cfg.pct);
@@ -1201,8 +1311,15 @@
         doc = app.open(copyFile);
     }
 
-    app.doScript(function () { main(doc, cfg); },
-        ScriptLanguage.JAVASCRIPT, [],
-        UndoModes.ENTIRE_SCRIPT, "Scale Artwork Document");
+    try {
+        app.doScript(function () { main(doc, cfg); },
+            ScriptLanguage.JAVASCRIPT, [],
+            UndoModes.ENTIRE_SCRIPT, "Scale Artwork Document");
+    } catch (err) {
+        PROG.close();
+        alert("Scale Artwork — stopped with an error:\n\n" + err +
+              (err.line ? "\n(line " + err.line + ")" : "") +
+              "\n\nThe whole run is one undo step (Ctrl/Cmd-Z).");
+    }
 
 })();
