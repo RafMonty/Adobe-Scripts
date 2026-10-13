@@ -1,7 +1,28 @@
 /* =========================================================================
-   ScaleArtwork.jsx  —  v1.1
+   ScaleDocument.jsx  —  v1.2
    Scale a large-format InDesign document to a new size, with optional
    bleed added by ENLARGING THE PAGE (trim + bleed becomes the page size).
+
+   v1.2 — New size can be entered as a PERCENTAGE, a target WIDTH or a
+          target HEIGHT (mm / in / pt). Width/height are measured against
+          the ACTIVE page's trim; the dialog shows the current size and a
+          live readout of the result. One uniform factor is applied to the
+          whole document.
+          Added a "verify & fix" pass: live values that InDesign's
+          Apply-to-Content may leave alone (paragraph rules, underlines,
+          strikethroughs, paragraph borders/shading, table & cell strokes,
+          column widths/row heights, frame insets, column gutters,
+          anchored-object offsets) are snapshotted before scaling and
+          corrected afterwards if they did not change. Values InDesign
+          already scaled are left alone, so nothing is scaled twice.
+          Style-definition scaling now also covers paragraph borders and
+          shading corner radii, span/split column gutters, hyphenation
+          zone, object-style text frame options, anchored-object offsets
+          and frame-fitting crops. Optional scaling of custom dashed /
+          dotted stroke style definitions.
+          FIX: the table-style pass skipped index 0, which is [Basic
+          Table] (a real, usable style). Placeholder styles ([None],
+          [No Paragraph Style]) are now skipped by NAME.
 
    v1.1 — Rebuilt the placement engine. v1 scaled items around a fixed
           pasteboard anchor and assumed the page stayed put through
@@ -15,8 +36,9 @@
 
    WHAT IT DOES
    ------------
-   1. Scales every page and every page item (incl. pasteboard items) by a
-      user-entered percentage, anchored at each page's top-left.
+   1. Scales every page and every page item (incl. pasteboard items) by
+      one factor, anchored at each page's top-left. The factor comes from
+      a percentage, or from a target width / height of the active page.
    2. Uses "Apply to Content" scaling so point sizes, leading, indents,
       tabs, stroke weights and effects become REAL new values — no
       "48pt (12pt)" bracketed values.
@@ -30,10 +52,12 @@
       unscaled styles. Without this, "Clear Overrides" would blow text
       back up to original size, and GREP styles would re-apply unscaled
       point sizes.
-   5. Runs redefineScaling() on all items afterwards so every frame
+   5. Verifies live text, frames and tables and fixes any measured value
+      that did not scale (see v1.2 note above).
+   6. Runs redefineScaling() on all items afterwards so every frame
       reads 100% / 100% (placed graphics are skipped so their scale %
       stays meaningful in the Links panel).
-   6. Optionally scales guides, margins/columns, and the baseline /
+   7. Optionally scales guides, margins/columns, and the baseline /
       document grids; optionally zeroes the document bleed values;
       optionally reports overset stories at the end.
 
@@ -48,9 +72,15 @@
    - Designed for single-page-per-spread artwork documents. Facing-page
      spreads with 2+ pages will trigger a warning (spine-glue behaviour
      of page resize makes multi-page spreads unreliable for this).
+   - Target width/height refer to the TRIM of the active page. Bleed is
+     added on top. Documents with mixed page sizes still get one uniform
+     factor, derived from the active page.
    - Style-definition scaling writes computed values back to each style,
      which makes those attributes explicit (flattens based-on
      inheritance for the scaled attributes only). Values stay correct.
+   - The verify & fix pass only touches a value when it is still exactly
+     at its pre-scale size. Where it has to act on a paragraph / range it
+     creates a local override (the same thing Apply to Content does).
    - The script cannot invent artwork: objects must already extend past
      the trim for the new bleed area to be covered. Anything that stops
      dead on the trim edge will show white in the bleed zone.
@@ -74,23 +104,86 @@
     var MM2PT = 72 / 25.4;
     var EPS = 0.001; // drift tolerance in pt
 
+    var UNITS = [
+        { name: "mm", pt: 72 / 25.4 },
+        { name: "in", pt: 72 },
+        { name: "pt", pt: 1 }
+    ];
+
+    // ---------------------------------------------------------------------
+    // Small helpers (function declarations are hoisted, so these are usable
+    // from the dialog code below)
+    // ---------------------------------------------------------------------
+    function isNum(v) { return typeof v === "number" && isFinite(v); }
+
+    function fmt(n) {
+        // Up to 3 decimals, trailing zeros removed: 420 / 37.5 / 0.118
+        if (!isNum(n)) return "?";
+        var str = n.toFixed(3);
+        str = str.replace(/0+$/, "").replace(/\.$/, "");
+        if (str === "-0") str = "0";
+        return str;
+    }
+
+    function getReferencePage(doc) {
+        // The active page of the layout window (usually page 1); falls
+        // back to page 1 when there is no layout window.
+        try {
+            var win = app.activeWindow;
+            if (win && win instanceof LayoutWindow) {
+                var p = win.activePage;
+                if (p && p.isValid) return p;
+            }
+        } catch (e) {}
+        return doc.pages[0];
+    }
+
+    function pageSizePt(page) {
+        var saved = app.scriptPreferences.measurementUnit;
+        app.scriptPreferences.measurementUnit = MeasurementUnits.POINTS;
+        var b;
+        try { b = page.bounds; } // [y1, x1, y2, x2]
+        finally { app.scriptPreferences.measurementUnit = saved; }
+        return { w: b[3] - b[1], h: b[2] - b[0] };
+    }
+
     // ---------------------------------------------------------------------
     // Dialog
     // ---------------------------------------------------------------------
-    function showDialog() {
+    function showDialog(doc) {
+        var refPage = getReferencePage(doc);
+        var cur = pageSizePt(refPage);
+        var refIndex = 0;
+        try { refIndex = refPage.documentOffset; } catch (e) {}
+
         var w = new Window("dialog", "Scale Artwork Document");
         w.orientation = "column";
         w.alignChildren = "fill";
 
-        // --- Scale ---
-        var pScale = w.add("panel", undefined, "Scale");
-        pScale.orientation = "row";
-        pScale.alignChildren = "center";
-        pScale.margins = 15;
-        pScale.add("statictext", undefined, "New size (% of original):");
-        var etScale = pScale.add("edittext", undefined, "50");
-        etScale.characters = 7;
-        pScale.add("statictext", undefined, "%   (e.g. 25 = quarter size)");
+        // --- Size ---
+        var pSize = w.add("panel", undefined, "New size");
+        pSize.orientation = "column";
+        pSize.alignChildren = "left";
+        pSize.margins = 15;
+
+        var gMode = pSize.add("group");
+        gMode.alignChildren = "center";
+        gMode.add("statictext", undefined, "Set by:");
+        var ddMode = gMode.add("dropdownlist", undefined,
+            ["Percent of original", "Target width", "Target height"]);
+        ddMode.selection = 0;
+        var etVal = gMode.add("edittext", undefined, "50");
+        etVal.characters = 9;
+        var stAfter = gMode.add("statictext", undefined, "%");
+        stAfter.characters = 3;
+        gMode.add("statictext", undefined, "   Units:");
+        var ddUnit = gMode.add("dropdownlist", undefined, ["mm", "in", "pt"]);
+        ddUnit.selection = 0;
+
+        var stCur = pSize.add("statictext", undefined, "");
+        stCur.characters = 78;
+        var stNew = pSize.add("statictext", undefined, "");
+        stNew.characters = 78;
 
         // --- Bleed ---
         var pBleed = w.add("panel", undefined, "Bleed (extends the page — document bleed settings are NOT used)");
@@ -101,7 +194,8 @@
         gB.add("statictext", undefined, "Bleed each side:");
         var etBleed = gB.add("edittext", undefined, "0");
         etBleed.characters = 7;
-        gB.add("statictext", undefined, "mm");
+        var stBleedUnit = gB.add("statictext", undefined, "mm");
+        stBleedUnit.characters = 3;
         var rbOrig = pBleed.add("radiobutton", undefined, "Value is at ORIGINAL size (scales down with the artwork)");
         var rbFinal = pBleed.add("radiobutton", undefined, "Value is FINAL size (applied as-is after scaling)");
         rbOrig.value = true;
@@ -112,6 +206,8 @@
         pOpt.alignChildren = "left";
         pOpt.margins = 15;
         var cbStyles = pOpt.add("checkbox", undefined, "Scale style definitions (paragraph / character / object / table / cell)");
+        var cbLiveFix = pOpt.add("checkbox", undefined, "Verify live text && tables after scaling: fix rules, underlines, borders, insets, cell strokes left unscaled");
+        var cbStrokeStyles = pOpt.add("checkbox", undefined, "Scale custom dashed / dotted stroke style definitions (dash && gap lengths)");
         var cbParents = pOpt.add("checkbox", undefined, "Include parent (master) pages");
         var cbGuides = pOpt.add("checkbox", undefined, "Scale ruler guides");
         var cbMargins = pOpt.add("checkbox", undefined, "Scale margins && columns");
@@ -120,6 +216,8 @@
         var cbZeroBleed = pOpt.add("checkbox", undefined, "Zero out document bleed values (avoid double bleed on export)");
         var cbOverset = pOpt.add("checkbox", undefined, "Check for overset text afterwards");
         cbStyles.value = true;
+        cbLiveFix.value = true;
+        cbStrokeStyles.value = true;
         cbParents.value = true;
         cbGuides.value = true;
         cbMargins.value = true;
@@ -137,19 +235,82 @@
         gBtn.add("button", undefined, "Cancel", { name: "cancel" });
         gBtn.add("button", undefined, "OK", { name: "ok" });
 
+        // --- Live behaviour ---
+        function unit() { return UNITS[ddUnit.selection.index]; }
+        function modeIdx() { return ddMode.selection.index; }
+
+        function currentScale() {
+            var v = parseFloat(etVal.text);
+            if (isNaN(v) || v <= 0) return NaN;
+            var m = modeIdx();
+            if (m === 0) return v / 100;
+            var pt = v * unit().pt;
+            return m === 1 ? pt / cur.w : pt / cur.h;
+        }
+
+        function refresh() {
+            var u = unit();
+            var isPct = modeIdx() === 0;
+            stAfter.text = isPct ? "%" : u.name;
+            stBleedUnit.text = u.name;
+            stCur.text = "Reference: page " + (refIndex + 1) + " (active page), trim " +
+                         fmt(cur.w / u.pt) + " x " + fmt(cur.h / u.pt) + " " + u.name;
+            var s = currentScale();
+            if (!isNum(s)) {
+                stNew.text = "Result: enter a positive number.";
+            } else {
+                stNew.text = "Result: " + fmt(cur.w * s / u.pt) + " x " + fmt(cur.h * s / u.pt) +
+                             " " + u.name + " trim  =  " + fmt(s * 100) + " %   (bleed is added on top)";
+            }
+        }
+
+        ddMode.onChange = function () {
+            var u = unit();
+            var m = modeIdx();
+            if (m === 0) etVal.text = "50";
+            else if (m === 1) etVal.text = fmt(cur.w / u.pt);
+            else etVal.text = fmt(cur.h / u.pt);
+            refresh();
+        };
+
+        var prevUnitPt = unit().pt;
+        ddUnit.onChange = function () {
+            var newPt = unit().pt;
+            if (newPt !== prevUnitPt) {
+                if (modeIdx() !== 0) {
+                    var v = parseFloat(etVal.text);
+                    if (!isNaN(v)) etVal.text = fmt(v * prevUnitPt / newPt);
+                }
+                var b = parseFloat(etBleed.text);
+                if (!isNaN(b)) etBleed.text = fmt(b * prevUnitPt / newPt);
+                prevUnitPt = newPt;
+            }
+            refresh();
+        };
+
+        etVal.onChanging = refresh;
+        etVal.onChange = refresh;
+        refresh();
+
         if (w.show() !== 1) return null;
 
-        var pct = parseFloat(etScale.text);
-        var bleedMM = parseFloat(etBleed.text);
-        if (isNaN(pct) || pct <= 0) { alert("Scale must be a positive number."); return null; }
-        if (isNaN(bleedMM) || bleedMM < 0) { alert("Bleed must be zero or a positive number."); return null; }
+        var scale = currentScale();
+        var bleedVal = parseFloat(etBleed.text);
+        if (!isNum(scale) || scale <= 0) { alert("New size must be a positive number."); return null; }
+        if (isNaN(bleedVal) || bleedVal < 0) { alert("Bleed must be zero or a positive number."); return null; }
 
         return {
-            scale: pct / 100,
-            pct: pct,
-            bleedMM: bleedMM,
+            scale: scale,
+            pct: scale * 100,
+            mode: modeIdx(),
+            unitName: unit().name,
+            unitPt: unit().pt,
+            refPageIndex: refIndex,
+            bleedPt: bleedVal * unit().pt,  // before the original/final adjustment
             bleedIsOriginal: rbOrig.value,
             doStyles: cbStyles.value,
+            doLiveFix: cbLiveFix.value,
+            doStrokeStyles: cbStrokeStyles.value,
             doParents: cbParents.value,
             doGuides: cbGuides.value,
             doMargins: cbMargins.value,
@@ -164,8 +325,6 @@
     // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
-    function isNum(v) { return typeof v === "number" && isFinite(v); }
-
     function scaleNumProp(obj, prop, s) {
         // Scales obj[prop] only if it currently holds a plain finite number.
         // Enum values (e.g. Leading.AUTO) and unset character-style
@@ -176,12 +335,35 @@
         } catch (e) { /* property absent in this version — ignore */ }
     }
 
+    function scaleInsetProp(obj, prop, s) {
+        // For properties that may be a single number or a 4-value array
+        try {
+            var v = obj[prop];
+            if (isNum(v)) { obj[prop] = v * s; }
+            else if (v && v.length === 4) {
+                obj[prop] = [v[0] * s, v[1] * s, v[2] * s, v[3] * s];
+            }
+        } catch (e) {}
+    }
+
     function isGraphicClass(item) {
         var n = "";
         try { n = String(item.constructor.name); } catch (e) { return false; }
         return n === "Image" || n === "EPS" || n === "PDF" || n === "WMF" ||
                n === "PICT" || n === "ImportedPage" || n === "Graphic" ||
                n === "EPSText" || n === "Movie" || n === "Sound";
+    }
+
+    function className(obj) {
+        try { return String(obj.constructor.name); } catch (e) { return ""; }
+    }
+
+    function isPlaceholderStyle(st) {
+        // [None], [No Paragraph Style], [No Character Style] ... but NOT
+        // [Basic Paragraph] / [Basic Table], which are real, editable styles.
+        var n = "";
+        try { n = String(st.name); } catch (e) { return false; }
+        return /^\[(None|No [^\]]*)\]$/.test(n);
     }
 
     // ---------------------------------------------------------------------
@@ -217,6 +399,8 @@
     // Style-definition scaling
     // Read all computed values first, THEN write, so based-on chains don't
     // get scaled twice (writing to a parent changes what a child reads).
+    // Property names that don't exist in this InDesign version are
+    // silently skipped.
     // ---------------------------------------------------------------------
     var TEXT_PROPS = [
         "pointSize", "leading", "baselineShift",
@@ -226,13 +410,24 @@
     var PARA_PROPS = TEXT_PROPS.concat([
         "spaceBefore", "spaceAfter",
         "firstLineIndent", "leftIndent", "rightIndent", "lastLineIndent",
+        "hyphenationZone",
         "ruleAboveOffset", "ruleAboveWeight", "ruleAboveLeftIndent", "ruleAboveRightIndent",
         "ruleBelowOffset", "ruleBelowWeight", "ruleBelowLeftIndent", "ruleBelowRightIndent",
-        // Newer paragraph border/shading offsets — silently skipped on older versions
+        // Span / split columns (CS5+)
+        "spanColumnInsideGutter", "spanColumnOutsideGutter",
+        "spanColumnMinSpaceBefore", "spanColumnMinSpaceAfter",
+        "splitColumnInsideGutter", "splitColumnOutsideGutter",
+        // Paragraph borders & shading (CC 2018+)
+        "paragraphBorderTopLineWeight", "paragraphBorderBottomLineWeight",
+        "paragraphBorderLeftLineWeight", "paragraphBorderRightLineWeight",
         "paragraphBorderTopOffset", "paragraphBorderBottomOffset",
         "paragraphBorderLeftOffset", "paragraphBorderRightOffset",
+        "paragraphBorderTopLeftCornerRadius", "paragraphBorderTopRightCornerRadius",
+        "paragraphBorderBottomLeftCornerRadius", "paragraphBorderBottomRightCornerRadius",
         "paragraphShadingTopOffset", "paragraphShadingBottomOffset",
-        "paragraphShadingLeftOffset", "paragraphShadingRightOffset"
+        "paragraphShadingLeftOffset", "paragraphShadingRightOffset",
+        "paragraphShadingTopLeftCornerRadius", "paragraphShadingTopRightCornerRadius",
+        "paragraphShadingBottomLeftCornerRadius", "paragraphShadingBottomRightCornerRadius"
     ]);
 
     function snapshotProps(style, propList) {
@@ -267,12 +462,12 @@
         }
     }
 
-    function scaleStyleCollection(styles, propList, s, skipFirst) {
+    function scaleStyleCollection(styles, propList, s) {
         var arr = [], snaps = [], i;
         for (i = 0; i < styles.length; i++) arr.push(styles[i]);
         // Pass 1: read everything (computed values)
         for (i = 0; i < arr.length; i++) {
-            if (skipFirst && i === 0) { snaps.push(null); continue; } // "[No Paragraph Style]" / "[None]"
+            if (isPlaceholderStyle(arr[i])) { snaps.push(null); continue; }
             snaps.push(snapshotProps(arr[i], propList));
         }
         // Pass 2: write scaled values
@@ -285,36 +480,62 @@
         return count;
     }
 
+    var FRAME_PREF_PROPS = [
+        "textColumnGutter", "textColumnFixedWidth", "minimumFirstBaselineOffset",
+        // Column rules (CC 2020+) — names vary by version; absent ones are skipped
+        "columnRuleWidth", "columnRuleStrokeWeight", "columnRuleOffset",
+        "columnRuleInsetStart", "columnRuleInsetEnd"
+    ];
+    var BASELINE_GRID_PROPS = ["baselineFrameGridIncrement", "startingOffsetForBaselineFrameGrid"];
+    var ANCHOR_PROPS = ["anchorXoffset", "anchorYoffset", "anchorSpaceAbove"];
+    var FIT_PROPS = ["topCrop", "bottomCrop", "leftCrop", "rightCrop"];
+
     function scaleObjectStyles(doc, s) {
-        var styles = doc.allObjectStyles, count = 0;
+        var styles = doc.allObjectStyles, count = 0, k;
         for (var i = 0; i < styles.length; i++) {
             var os = styles[i];
-            try {
-                if (os.name === "[None]") continue;
-            } catch (e) {}
+            if (isPlaceholderStyle(os)) continue;
             scaleNumProp(os, "strokeWeight", s);
             scaleNumProp(os, "cornerRadius", s);
             scaleNumProp(os, "topLeftCornerRadius", s);
             scaleNumProp(os, "topRightCornerRadius", s);
             scaleNumProp(os, "bottomLeftCornerRadius", s);
             scaleNumProp(os, "bottomRightCornerRadius", s);
-            // Text frame insets held in the style definition
+
+            // Text frame options held in the style definition. Prefer the
+            // textFramePreferences sub-object; fall back to a direct
+            // insetSpacing property on older versions. Never both.
+            var viaPrefs = false;
             try {
-                var ins = os.insetSpacing;
-                if (isNum(ins)) { os.insetSpacing = ins * s; }
-                else if (ins && ins.length === 4) {
-                    os.insetSpacing = [ins[0] * s, ins[1] * s, ins[2] * s, ins[3] * s];
+                var tfp = os.textFramePreferences;
+                if (tfp) {
+                    scaleInsetProp(tfp, "insetSpacing", s);
+                    for (k = 0; k < FRAME_PREF_PROPS.length; k++) scaleNumProp(tfp, FRAME_PREF_PROPS[k], s);
+                    viaPrefs = true;
                 }
             } catch (e) {}
+            if (!viaPrefs) scaleInsetProp(os, "insetSpacing", s);
+
+            try {
+                var bg = os.baselineFrameGridOptions;
+                for (k = 0; k < BASELINE_GRID_PROPS.length; k++) scaleNumProp(bg, BASELINE_GRID_PROPS[k], s);
+            } catch (e) {}
+
             // Text wrap offsets held in the style definition
+            try { scaleInsetProp(os.textWrapPreferences, "textWrapOffset", s); } catch (e) {}
+
+            // Anchored object offsets
             try {
-                var two = os.textWrapPreferences.textWrapOffset;
-                if (isNum(two)) { os.textWrapPreferences.textWrapOffset = two * s; }
-                else if (two && two.length === 4) {
-                    os.textWrapPreferences.textWrapOffset =
-                        [two[0] * s, two[1] * s, two[2] * s, two[3] * s];
-                }
+                var ao = os.anchoredObjectSettings;
+                for (k = 0; k < ANCHOR_PROPS.length; k++) scaleNumProp(ao, ANCHOR_PROPS[k], s);
             } catch (e) {}
+
+            // Frame fitting crop amounts
+            try {
+                var ff = os.frameFittingOptions;
+                for (k = 0; k < FIT_PROPS.length; k++) scaleNumProp(ff, FIT_PROPS[k], s);
+            } catch (e) {}
+
             scaleEffectsOn(os, s);
             count++;
         }
@@ -331,6 +552,229 @@
         "topEdgeStrokeWeight", "bottomEdgeStrokeWeight",
         "leftEdgeStrokeWeight", "rightEdgeStrokeWeight"
     ];
+
+    // ---------------------------------------------------------------------
+    // Custom dashed / dotted stroke style definitions.
+    // Custom styles store dash / gap lengths as absolute points, so they
+    // don't follow the stroke weight. InDesign's built-in ones are relative
+    // to the weight and read-only; they're skipped by name and by try/catch.
+    // ---------------------------------------------------------------------
+    var BUILTIN_STROKE_NAMES = {
+        "Dashed (3 and 2)": 1, "Dashed (4 and 4)": 1, "Dashed": 1,
+        "Dotted": 1, "Japanese Dots": 1
+    };
+
+    function scaleStrokeStyles(doc, s) {
+        var n = 0, i;
+        var scaleArr = function (st, prop) {
+            try {
+                if (BUILTIN_STROKE_NAMES[String(st.name)]) return false;
+                var a = st[prop];
+                if (!(a instanceof Array) || a.length === 0) return false;
+                var out = [];
+                for (var j = 0; j < a.length; j++) out.push(isNum(a[j]) ? a[j] * s : a[j]);
+                st[prop] = out;
+                return true;
+            } catch (e) { return false; }
+        };
+        try {
+            var ds = doc.dashedStrokeStyles;
+            for (i = 0; i < ds.length; i++) if (scaleArr(ds[i], "dashArray")) n++;
+        } catch (e) {}
+        try {
+            var dt = doc.dottedStrokeStyles;
+            for (i = 0; i < dt.length; i++) if (scaleArr(dt[i], "dotArray")) n++;
+        } catch (e) {}
+        return n;
+    }
+
+    // ---------------------------------------------------------------------
+    // Live "verify & fix" engine.
+    //   Before scaling, snapshot measured values on live paragraphs, style
+    //   ranges, tables, cells, text frames and anchored objects. After
+    //   scaling (items + style definitions), re-read each value:
+    //     - unchanged (still == pre)      -> InDesign left it; set pre * s
+    //     - already == pre * s            -> fine, count as OK
+    //     - anything else                 -> leave it, count as "other"
+    //   A value is only ever written when it is provably unscaled, so this
+    //   can't double-scale. Zero values are skipped (0 * s = 0).
+    // ---------------------------------------------------------------------
+    var LIVE_PARA_PROPS = [
+        "spaceBefore", "spaceAfter",
+        "firstLineIndent", "leftIndent", "rightIndent", "lastLineIndent",
+        "hyphenationZone",
+        "ruleAboveWeight", "ruleAboveOffset", "ruleAboveLeftIndent", "ruleAboveRightIndent",
+        "ruleBelowWeight", "ruleBelowOffset", "ruleBelowLeftIndent", "ruleBelowRightIndent",
+        "paragraphBorderTopLineWeight", "paragraphBorderBottomLineWeight",
+        "paragraphBorderLeftLineWeight", "paragraphBorderRightLineWeight",
+        "paragraphBorderTopOffset", "paragraphBorderBottomOffset",
+        "paragraphBorderLeftOffset", "paragraphBorderRightOffset",
+        "paragraphShadingTopOffset", "paragraphShadingBottomOffset",
+        "paragraphShadingLeftOffset", "paragraphShadingRightOffset"
+    ];
+    var LIVE_CHAR_PROPS = [
+        "pointSize", "leading", "baselineShift",
+        "underlineWeight", "underlineOffset",
+        "strikeThroughWeight", "strikeThroughOffset"
+    ];
+    var LIVE_TABLE_PROPS = TABLE_PROPS;
+    var LIVE_CELL_PROPS = CELL_PROPS;
+    var LIVE_FRAME_PROPS = ["insetSpacing"].concat(FRAME_PREF_PROPS);
+
+    var TOL = 0.002; // pt; InDesign rounds stored values to ~0.001
+
+    function snapVal(v) {
+        if (isNum(v)) return v;
+        if (v && v.length === 4 && isNum(v[0]) && isNum(v[1]) && isNum(v[2]) && isNum(v[3])) {
+            return [v[0], v[1], v[2], v[3]];
+        }
+        return null; // enum / mixed / absent
+    }
+
+    function near(a, b) { return Math.abs(a - b) <= TOL; }
+    function arrNear(a, b) {
+        if (!a || !b || a.length !== b.length) return false;
+        for (var i = 0; i < a.length; i++) if (!near(a[i], b[i])) return false;
+        return true;
+    }
+    function mulArr(a, s) { return [a[0] * s, a[1] * s, a[2] * s, a[3] * s]; }
+    function allZero(a) { return a[0] === 0 && a[1] === 0 && a[2] === 0 && a[3] === 0; }
+
+    function readBulk(spec, objs, prop) {
+        // Reads prop for every object. Uses an everyItem() specifier when
+        // available (one call), falling back to per-object reads.
+        var n = objs.length, a = null, i;
+        if (spec) {
+            try {
+                a = spec[prop];
+                if (n === 1) a = [a];
+                if (!(a instanceof Array) || a.length !== n) a = null;
+            } catch (e) { a = null; }
+        }
+        if (!a) {
+            a = [];
+            for (i = 0; i < n; i++) {
+                try { a.push(objs[i][prop]); } catch (e) { a.push(null); }
+            }
+        }
+        return a;
+    }
+
+    function snapObjects(objs, spec, props) {
+        var snap = { objs: objs, spec: spec, vals: {} };
+        for (var p = 0; p < props.length; p++) {
+            var raw = readBulk(spec, objs, props[p]);
+            var arr = [], any = false;
+            for (var i = 0; i < raw.length; i++) {
+                var v = snapVal(raw[i]);
+                if (v !== null) any = true;
+                arr.push(v);
+            }
+            if (any) snap.vals[props[p]] = arr;
+        }
+        return snap;
+    }
+
+    function verifySnap(snap, s, counts) {
+        var objs = snap.objs, n = objs.length;
+        for (var prop in snap.vals) {
+            var pre = snap.vals[prop];
+            var cur = readBulk(snap.spec, objs, prop);
+            for (var i = 0; i < n; i++) {
+                var p = pre[i];
+                if (p === null) continue;
+                var c = snapVal(cur[i]);
+                if (c === null) continue;
+                if (isNum(p)) {
+                    if (p === 0) continue;
+                    if (Math.abs(p * s - p) <= 2 * TOL) continue;   // can't tell scaled from unscaled
+                    if (near(c, p * s)) { counts.ok++; continue; }
+                    if (near(c, p)) {
+                        try { objs[i][prop] = p * s; counts.fixed++; }
+                        catch (e) { counts.failed++; }
+                    } else { counts.other++; }
+                } else {
+                    if (allZero(p)) continue;
+                    var ps = mulArr(p, s);
+                    if (arrNear(c, ps)) { counts.ok++; continue; }
+                    if (arrNear(c, p)) {
+                        try { objs[i][prop] = ps; counts.fixed++; }
+                        catch (e) { counts.failed++; }
+                    } else { counts.other++; }
+                }
+            }
+        }
+    }
+
+    function takeLiveSnapshot(doc, cfg) {
+        var entries = [];
+        var i, t, c;
+        var add = function (objs, spec, props) {
+            if (objs && objs.length > 0) entries.push(snapObjects(objs, spec, props));
+        };
+
+        // ---- stories: paragraphs, style ranges, tables ----
+        var stories = [];
+        try { stories = doc.stories.everyItem().getElements(); } catch (e) {}
+        for (i = 0; i < stories.length; i++) {
+            var st = stories[i];
+            try { add(st.paragraphs.everyItem().getElements(), st.paragraphs.everyItem(), LIVE_PARA_PROPS); } catch (e) {}
+            try { add(st.textStyleRanges.everyItem().getElements(), st.textStyleRanges.everyItem(), LIVE_CHAR_PROPS); } catch (e) {}
+
+            var tables = [];
+            try { tables = st.tables.everyItem().getElements(); } catch (e) {}
+            for (t = 0; t < tables.length; t++) {
+                var tb = tables[t];
+                add([tb], null, LIVE_TABLE_PROPS);
+                try { add(tb.columns.everyItem().getElements(), tb.columns.everyItem(), ["width"]); } catch (e) {}
+                try { add(tb.rows.everyItem().getElements(), tb.rows.everyItem(), ["minimumHeight", "height"]); } catch (e) {}
+                var cells = [];
+                try {
+                    cells = tb.cells.everyItem().getElements();
+                    add(cells, tb.cells.everyItem(), LIVE_CELL_PROPS);
+                } catch (e) {}
+                for (c = 0; c < cells.length; c++) {
+                    try { add(cells[c].paragraphs.everyItem().getElements(), cells[c].paragraphs.everyItem(), LIVE_PARA_PROPS); } catch (e) {}
+                    try { add(cells[c].textStyleRanges.everyItem().getElements(), cells[c].textStyleRanges.everyItem(), LIVE_CHAR_PROPS); } catch (e) {}
+                }
+            }
+        }
+
+        // ---- page items: text frame prefs, frame baseline grids, anchored offsets ----
+        var items = [];
+        try { items = doc.allPageItems; } catch (e) {}
+        if (cfg.doParents) {
+            for (i = 0; i < doc.masterSpreads.length; i++) {
+                try { items = items.concat(doc.masterSpreads[i].allPageItems); } catch (e) {}
+            }
+        }
+        var framePrefs = [], gridOpts = [], anchors = [];
+        for (i = 0; i < items.length; i++) {
+            var it = items[i];
+            try {
+                if (className(it) === "TextFrame") {
+                    framePrefs.push(it.textFramePreferences);
+                    try { gridOpts.push(it.baselineFrameGridOptions); } catch (e1) {}
+                }
+            } catch (e) {}
+            try {
+                if (className(it.parent) === "Character") anchors.push(it.anchoredObjectSettings);
+            } catch (e) {}
+        }
+        add(framePrefs, null, LIVE_FRAME_PROPS);
+        add(gridOpts, null, BASELINE_GRID_PROPS);
+        add(anchors, null, ANCHOR_PROPS);
+
+        return entries;
+    }
+
+    function applyLiveFixes(entries, s) {
+        var counts = { fixed: 0, ok: 0, other: 0, failed: 0 };
+        for (var i = 0; i < entries.length; i++) {
+            try { verifySnap(entries[i], s, counts); } catch (e) {}
+        }
+        return counts;
+    }
 
     // ---------------------------------------------------------------------
     // Spread engine (v1.1): measure-and-place.
@@ -501,23 +945,25 @@
     function main(doc, cfg) {
 
         var s = cfg.scale;
-        var bleedPt = cfg.bleedMM * MM2PT;
+        var bleedPt = cfg.bleedPt;
         if (cfg.bleedIsOriginal) bleedPt = bleedPt * s; // entered at original size → scales down
+        var U = cfg.unitPt, UN = cfg.unitName;
 
         var summary = [];
         var savedPrefs = {};
         var lockedLayers = [];
         var lockedItems = [];
         var i, j;
-        var b0;
+        var b0, refPage;
 
         try {
             // ------- save & set app/doc prefs -------
             savedPrefs.measurementUnit = app.scriptPreferences.measurementUnit;
             app.scriptPreferences.measurementUnit = MeasurementUnits.POINTS;
 
-            // ------- record starting size (page 1), now guaranteed in points -------
-            b0 = doc.pages[0].bounds; // [y1, x1, y2, x2]
+            // ------- record starting size (reference page), now guaranteed in points -------
+            refPage = (cfg.refPageIndex < doc.pages.length) ? doc.pages[cfg.refPageIndex] : doc.pages[0];
+            b0 = refPage.bounds; // [y1, x1, y2, x2]
 
             savedPrefs.enableRedraw = app.scriptPreferences.enableRedraw;
             app.scriptPreferences.enableRedraw = false;
@@ -556,12 +1002,19 @@
                 }
             }
 
+            // ------- live snapshot (before anything moves; units are points) -------
+            var live = null;
+            if (cfg.doLiveFix && s !== 1) {
+                try { live = takeLiveSnapshot(doc, cfg); }
+                catch (e) { live = null; summary.push("Live verify skipped (snapshot failed: " + e + ")."); }
+            }
+
             // ------- spreads -------
             var report = { maxResid: 0 };
             for (i = 0; i < doc.spreads.length; i++) {
                 processSpread(doc.spreads[i], s, bleedPt, cfg, report);
             }
-            summary.push(doc.spreads.length + " spread(s) scaled to " + cfg.pct + "%.");
+            summary.push(doc.spreads.length + " spread(s) scaled to " + fmt(cfg.pct) + "%.");
 
             if (cfg.doParents) {
                 for (i = 0; i < doc.masterSpreads.length; i++) {
@@ -576,21 +1029,37 @@
                   " pt on at least one item — check positions.");
 
             if (bleedPt > 0) {
-                summary.push("Pages extended by " + (bleedPt / MM2PT).toFixed(2) +
-                             " mm bleed per side (page size now = trim + bleed).");
+                summary.push("Pages extended by " + fmt(bleedPt / U) + " " + UN +
+                             " bleed per side (page size now = trim + bleed).");
             }
 
             // ------- style definitions -------
             if (cfg.doStyles && s !== 1) {
-                var nP = scaleStyleCollection(doc.allParagraphStyles, PARA_PROPS, s, true);
-                var nC = scaleStyleCollection(doc.allCharacterStyles, TEXT_PROPS, s, true);
+                var nP = scaleStyleCollection(doc.allParagraphStyles, PARA_PROPS, s);
+                var nC = scaleStyleCollection(doc.allCharacterStyles, TEXT_PROPS, s);
                 var nO = scaleObjectStyles(doc, s);
                 var nT = 0, nCe = 0;
-                try { nT = scaleStyleCollection(doc.allTableStyles, TABLE_PROPS, s, true); } catch (e) {}
-                try { nCe = scaleStyleCollection(doc.allCellStyles, CELL_PROPS, s, true); } catch (e) {}
+                try { nT = scaleStyleCollection(doc.allTableStyles, TABLE_PROPS, s); } catch (e) {}
+                try { nCe = scaleStyleCollection(doc.allCellStyles, CELL_PROPS, s); } catch (e) {}
                 try { applyProps(doc.textDefaults, snapshotProps(doc.textDefaults, PARA_PROPS), s); } catch (e) {}
                 summary.push("Styles scaled — para: " + nP + ", char: " + nC +
                              ", object: " + nO + ", table: " + nT + ", cell: " + nCe + ".");
+            }
+
+            // ------- custom stroke styles -------
+            if (cfg.doStrokeStyles && s !== 1) {
+                var nS = scaleStrokeStyles(doc, s);
+                if (nS > 0) summary.push("Custom dashed/dotted stroke styles scaled: " + nS + ".");
+            }
+
+            // ------- live verify & fix -------
+            if (live) {
+                var lc = applyLiveFixes(live, s);
+                var msg = "Live text/table check: " + lc.fixed + " value(s) corrected, " +
+                          lc.ok + " already scaled by InDesign.";
+                if (lc.other > 0) msg += " " + lc.other + " differed unexpectedly (left as-is).";
+                if (lc.failed > 0) msg += " " + lc.failed + " could not be written.";
+                summary.push(msg);
             }
 
             // ------- grids -------
@@ -662,10 +1131,11 @@
             }
 
             // ------- final size report -------
-            var b1 = doc.pages[0].bounds;
-            summary.push("Page 1: " +
-                ((b0[3] - b0[1]) / MM2PT).toFixed(1) + " x " + ((b0[2] - b0[0]) / MM2PT).toFixed(1) + " mm  ->  " +
-                ((b1[3] - b1[1]) / MM2PT).toFixed(1) + " x " + ((b1[2] - b1[0]) / MM2PT).toFixed(1) + " mm.");
+            var b1 = refPage.bounds;
+            summary.push("Page " + (cfg.refPageIndex + 1) + ": " +
+                fmt((b0[3] - b0[1]) / U) + " x " + fmt((b0[2] - b0[0]) / U) + " " + UN + "  ->  " +
+                fmt((b1[3] - b1[1]) / U) + " x " + fmt((b1[2] - b1[0]) / U) + " " + UN +
+                (bleedPt > 0 ? " (incl. bleed)." : "."));
 
             if (cfg.pct > 100) {
                 summary.push("Note: scaling UP reduces effective PPI of placed images — check the Links panel.");
@@ -698,10 +1168,10 @@
     // ---------------------------------------------------------------------
     // Run
     // ---------------------------------------------------------------------
-    var cfg = showDialog();
-    if (!cfg) return;
-
     var doc = app.activeDocument;
+
+    var cfg = showDialog(doc);
+    if (!cfg) return;
 
     // Pre-flight: multi-page spreads are unreliable for this operation
     var multi = false;
@@ -723,9 +1193,10 @@
         }
         var f = doc.fullName;
         var base = f.fsName.replace(/\.indd$/i, "");
-        var copyFile = new File(base + "_" + cfg.pct + "pc.indd");
+        var tag = fmt(cfg.pct);
+        var copyFile = new File(base + "_" + tag + "pc.indd");
         var n = 1;
-        while (copyFile.exists) { copyFile = new File(base + "_" + cfg.pct + "pc_" + (n++) + ".indd"); }
+        while (copyFile.exists) { copyFile = new File(base + "_" + tag + "pc_" + (n++) + ".indd"); }
         doc.saveACopy(copyFile);
         doc = app.open(copyFile);
     }
