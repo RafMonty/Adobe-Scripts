@@ -113,29 +113,56 @@
     ];
 
     // ---------------------------------------------------------------------
-    // Progress palette (non-modal). phase() sets the overall band of the
-    // bar for the current stage; step(frac, detail) moves within that band.
-    // Every call is wrapped so a UI hiccup can never abort the run.
+    // Progress palette (non-modal). Every call is wrapped so a UI hiccup
+    // can never abort the run.
+    //   phase(from, to, label)  — new stage; bar band [from..to]; forced redraw
+    //   step(frac, detail)      — bar position within the band (+ activity text)
+    //   detail(text)            — activity text only (what is being touched now)
+    //   Text and bar values are always set (cheap); the actual window repaint
+    //   is throttled to ~10/s so that reporting never slows the run down.
     // ---------------------------------------------------------------------
     var PROG = (function () {
-        var win = null, bar = null, stPhase = null, stDetail = null;
+        var win = null, bar = null, stPhase = null, stDetail = null, stTime = null;
         var base = 0, span = 0;
+        var t0 = 0, lastDraw = 0;
+        var REDRAW_MS = 100;
         function safe(f) { try { f(); } catch (e) {} }
+        function now() { return new Date().getTime(); }
+        function elapsed() {
+            var sec = Math.floor((now() - t0) / 1000);
+            var m = Math.floor(sec / 60), s = sec % 60;
+            return m + ":" + (s < 10 ? "0" : "") + s;
+        }
+        function draw(force) {
+            if (!win) return;
+            var t = now();
+            if (!force && t - lastDraw < REDRAW_MS) return;
+            lastDraw = t;
+            stTime.text = elapsed();
+            win.update();
+        }
         return {
             open: function () {
+                t0 = now();
                 safe(function () {
                     win = new Window("palette", "Scale Artwork Document", undefined, { closeButton: false });
                     win.orientation = "column";
                     win.alignChildren = "fill";
                     win.margins = 15;
-                    stPhase = win.add("statictext", undefined, "Starting...");
-                    stPhase.characters = 72;
+                    var row = win.add("group");
+                    row.orientation = "row";
+                    row.alignChildren = ["fill", "center"];
+                    stPhase = row.add("statictext", undefined, "Starting...");
+                    stPhase.characters = 64;
+                    stTime = row.add("statictext", undefined, "0:00");
+                    stTime.characters = 6;
+                    stTime.justify = "right";
                     bar = win.add("progressbar", undefined, 0, 100);
-                    bar.preferredSize = [480, 14];
+                    bar.preferredSize = [520, 14];
                     stDetail = win.add("statictext", undefined, " ", { truncate: "middle" });
-                    stDetail.characters = 72;
+                    stDetail.characters = 76;
                     win.show();
-                    win.update();
+                    draw(true);
                 });
             },
             phase: function (from, to, label) {
@@ -144,7 +171,7 @@
                     stPhase.text = label;
                     stDetail.text = " ";
                     bar.value = from;
-                    win.update();
+                    draw(true);
                 });
             },
             step: function (frac, detail) {
@@ -153,7 +180,13 @@
                     if (frac > 1) frac = 1;
                     bar.value = base + span * frac;
                     if (detail !== undefined) stDetail.text = detail;
-                    win.update();
+                    draw(false);
+                });
+            },
+            detail: function (text) {
+                safe(function () {
+                    stDetail.text = text;
+                    draw(false);
                 });
             },
             close: function () {
@@ -514,18 +547,29 @@
         }
     }
 
-    function scaleStyleCollection(styles, propList, s) {
-        var arr = [], snaps = [], i;
+    function styleName(st) {
+        try { return String(st.name); } catch (e) { return "?"; }
+    }
+
+    function scaleStyleCollection(styles, propList, s, label, f0, f1) {
+        // label / f0 / f1: progress text and bar band for this collection
+        var arr = [], snaps = [], i, n;
+        if (label === undefined) label = "Style";
+        if (f0 === undefined) { f0 = 0; f1 = 1; }
         for (i = 0; i < styles.length; i++) arr.push(styles[i]);
+        n = arr.length;
+        var span = (f1 - f0) / 2;
         // Pass 1: read everything (computed values)
-        for (i = 0; i < arr.length; i++) {
+        for (i = 0; i < n; i++) {
             if (isPlaceholderStyle(arr[i])) { snaps.push(null); continue; }
+            PROG.step(f0 + span * i / n, label + " " + (i + 1) + "/" + n + ": " + styleName(arr[i]) + " — reading");
             snaps.push(snapshotProps(arr[i], propList));
         }
         // Pass 2: write scaled values
         var count = 0;
-        for (i = 0; i < arr.length; i++) {
+        for (i = 0; i < n; i++) {
             if (!snaps[i]) continue;
+            PROG.step(f0 + span + span * i / n, label + " " + (i + 1) + "/" + n + ": " + styleName(arr[i]) + " — writing");
             applyProps(arr[i], snaps[i], s);
             count++;
         }
@@ -542,11 +586,14 @@
     var ANCHOR_PROPS = ["anchorXoffset", "anchorYoffset", "anchorSpaceAbove"];
     var FIT_PROPS = ["topCrop", "bottomCrop", "leftCrop", "rightCrop"];
 
-    function scaleObjectStyles(doc, s) {
-        var styles = doc.allObjectStyles, count = 0, k;
-        for (var i = 0; i < styles.length; i++) {
+    function scaleObjectStyles(doc, s, f0, f1) {
+        var styles = doc.allObjectStyles, count = 0, k, n = styles.length;
+        if (f0 === undefined) { f0 = 0; f1 = 1; }
+        for (var i = 0; i < n; i++) {
             var os = styles[i];
             if (isPlaceholderStyle(os)) continue;
+            var tag = "Object style " + (i + 1) + "/" + n + ": " + styleName(os) + " — ";
+            PROG.step(f0 + (f1 - f0) * i / n, tag + "stroke weight & corner radii");
             scaleNumProp(os, "strokeWeight", s);
             scaleNumProp(os, "cornerRadius", s);
             scaleNumProp(os, "topLeftCornerRadius", s);
@@ -558,6 +605,7 @@
             // textFramePreferences sub-object; fall back to a direct
             // insetSpacing property on older versions. Never both.
             var viaPrefs = false;
+            PROG.detail(tag + "text frame options (insets, gutter, baseline)");
             try {
                 var tfp = os.textFramePreferences;
                 if (tfp) {
@@ -574,20 +622,24 @@
             } catch (e) {}
 
             // Text wrap offsets held in the style definition
+            PROG.detail(tag + "text wrap offset");
             try { scaleInsetProp(os.textWrapPreferences, "textWrapOffset", s); } catch (e) {}
 
             // Anchored object offsets
+            PROG.detail(tag + "anchored object offsets");
             try {
                 var ao = os.anchoredObjectSettings;
                 for (k = 0; k < ANCHOR_PROPS.length; k++) scaleNumProp(ao, ANCHOR_PROPS[k], s);
             } catch (e) {}
 
             // Frame fitting crop amounts
+            PROG.detail(tag + "frame fitting crops");
             try {
                 var ff = os.frameFittingOptions;
                 for (k = 0; k < FIT_PROPS.length; k++) scaleNumProp(ff, FIT_PROPS[k], s);
             } catch (e) {}
 
+            PROG.detail(tag + "effects (shadows, glows, feathers)");
             scaleEffectsOn(os, s);
             count++;
         }
@@ -620,6 +672,7 @@
         var n = 0, i;
         var scaleArr = function (st, prop) {
             try {
+                PROG.detail("Stroke style: " + styleName(st) + " — " + prop);
                 if (BUILTIN_STROKE_NAMES[String(st.name)]) return false;
                 var a = st[prop];
                 if (!(a instanceof Array) || a.length === 0) return false;
@@ -712,9 +765,10 @@
         return a;
     }
 
-    function snapObjects(objs, spec, props) {
-        var snap = { objs: objs, spec: spec, vals: {} };
+    function snapObjects(objs, spec, props, label) {
+        var snap = { objs: objs, spec: spec, vals: {}, label: label || "" };
         for (var p = 0; p < props.length; p++) {
+            PROG.detail(snap.label + " (" + objs.length + ") — " + props[p]);
             var raw = readBulk(spec, objs, props[p]);
             var arr = [], any = false;
             for (var i = 0; i < raw.length; i++) {
@@ -730,6 +784,7 @@
     function verifySnap(snap, s, counts) {
         var objs = snap.objs, n = objs.length;
         for (var prop in snap.vals) {
+            PROG.detail(snap.label + " (" + n + ") — " + prop + "   [fixed so far: " + counts.fixed + "]");
             var pre = snap.vals[prop];
             var cur = readBulk(snap.spec, objs, prop);
             for (var i = 0; i < n; i++) {
@@ -761,40 +816,44 @@
     function takeLiveSnapshot(doc, cfg) {
         var entries = [];
         var i, t, c;
-        var add = function (objs, spec, props) {
-            if (objs && objs.length > 0) entries.push(snapObjects(objs, spec, props));
+        var add = function (objs, spec, props, label) {
+            if (objs && objs.length > 0) entries.push(snapObjects(objs, spec, props, label));
         };
 
         // ---- stories: paragraphs, style ranges, tables ----
         var stories = [];
         try { stories = doc.stories.everyItem().getElements(); } catch (e) {}
-        for (i = 0; i < stories.length; i++) {
+        var nSt = stories.length;
+        for (i = 0; i < nSt; i++) {
             var st = stories[i];
-            PROG.step(0.8 * i / stories.length, "Story " + (i + 1) + " of " + stories.length);
-            try { add(st.paragraphs.everyItem().getElements(), st.paragraphs.everyItem(), LIVE_PARA_PROPS); } catch (e) {}
-            try { add(st.textStyleRanges.everyItem().getElements(), st.textStyleRanges.everyItem(), LIVE_CHAR_PROPS); } catch (e) {}
+            var sLab = "Story " + (i + 1) + "/" + nSt;
+            PROG.step(0.8 * i / nSt, sLab);
+            try { add(st.paragraphs.everyItem().getElements(), st.paragraphs.everyItem(), LIVE_PARA_PROPS, sLab + " paragraphs"); } catch (e) {}
+            try { add(st.textStyleRanges.everyItem().getElements(), st.textStyleRanges.everyItem(), LIVE_CHAR_PROPS, sLab + " text ranges"); } catch (e) {}
 
             var tables = [];
             try { tables = st.tables.everyItem().getElements(); } catch (e) {}
             for (t = 0; t < tables.length; t++) {
                 var tb = tables[t];
-                add([tb], null, LIVE_TABLE_PROPS);
-                try { add(tb.columns.everyItem().getElements(), tb.columns.everyItem(), ["width"]); } catch (e) {}
-                try { add(tb.rows.everyItem().getElements(), tb.rows.everyItem(), ["minimumHeight", "height"]); } catch (e) {}
+                var tLab = sLab + " table " + (t + 1) + "/" + tables.length;
+                add([tb], null, LIVE_TABLE_PROPS, tLab);
+                try { add(tb.columns.everyItem().getElements(), tb.columns.everyItem(), ["width"], tLab + " columns"); } catch (e) {}
+                try { add(tb.rows.everyItem().getElements(), tb.rows.everyItem(), ["minimumHeight", "height"], tLab + " rows"); } catch (e) {}
                 var cells = [];
                 try {
                     cells = tb.cells.everyItem().getElements();
-                    add(cells, tb.cells.everyItem(), LIVE_CELL_PROPS);
+                    add(cells, tb.cells.everyItem(), LIVE_CELL_PROPS, tLab + " cells");
                 } catch (e) {}
                 for (c = 0; c < cells.length; c++) {
-                    try { add(cells[c].paragraphs.everyItem().getElements(), cells[c].paragraphs.everyItem(), LIVE_PARA_PROPS); } catch (e) {}
-                    try { add(cells[c].textStyleRanges.everyItem().getElements(), cells[c].textStyleRanges.everyItem(), LIVE_CHAR_PROPS); } catch (e) {}
+                    var cLab = tLab + " cell " + (c + 1) + "/" + cells.length;
+                    try { add(cells[c].paragraphs.everyItem().getElements(), cells[c].paragraphs.everyItem(), LIVE_PARA_PROPS, cLab + " paragraphs"); } catch (e) {}
+                    try { add(cells[c].textStyleRanges.everyItem().getElements(), cells[c].textStyleRanges.everyItem(), LIVE_CHAR_PROPS, cLab + " text ranges"); } catch (e) {}
                 }
             }
         }
 
         // ---- page items: text frame prefs, frame baseline grids, anchored offsets ----
-        PROG.step(0.85, "Text frames and anchored objects...");
+        PROG.step(0.82, "Collecting page items...");
         var items = [];
         try { items = doc.allPageItems; } catch (e) {}
         if (cfg.doParents) {
@@ -803,8 +862,12 @@
             }
         }
         var framePrefs = [], gridOpts = [], anchors = [];
-        for (i = 0; i < items.length; i++) {
+        var nIt = items.length;
+        for (i = 0; i < nIt; i++) {
             var it = items[i];
+            if (i % 50 === 0) {
+                PROG.step(0.82 + 0.1 * i / nIt, "Scanning page item " + (i + 1) + "/" + nIt + " (" + className(it) + ")");
+            }
             try {
                 if (className(it) === "TextFrame") {
                     framePrefs.push(it.textFramePreferences);
@@ -815,9 +878,10 @@
                 if (className(it.parent) === "Character") anchors.push(it.anchoredObjectSettings);
             } catch (e) {}
         }
-        add(framePrefs, null, LIVE_FRAME_PROPS);
-        add(gridOpts, null, BASELINE_GRID_PROPS);
-        add(anchors, null, ANCHOR_PROPS);
+        PROG.step(0.92, "Text frames: " + framePrefs.length + ", anchored objects: " + anchors.length);
+        add(framePrefs, null, LIVE_FRAME_PROPS, "Text frames");
+        add(gridOpts, null, BASELINE_GRID_PROPS, "Frame baseline grids");
+        add(anchors, null, ANCHOR_PROPS, "Anchored objects");
 
         return entries;
     }
@@ -825,10 +889,7 @@
     function applyLiveFixes(entries, s) {
         var counts = { fixed: 0, ok: 0, other: 0, failed: 0 };
         for (var i = 0; i < entries.length; i++) {
-            if (i % 5 === 0) {
-                PROG.step(i / entries.length, "Checking group " + (i + 1) + " of " + entries.length +
-                          "  (corrected so far: " + counts.fixed + ")");
-            }
+            PROG.step(i / entries.length, entries[i].label);
             try { verifySnap(entries[i], s, counts); } catch (e) {}
         }
         return counts;
@@ -892,8 +953,9 @@
         spreadProg(report, 0, "scaling " + items.length + " item(s)");
         if (s !== 1) {
             for (i = 0; i < items.length; i++) {
-                if (i % 25 === 0 && i > 0) {
-                    spreadProg(report, 0.45 * i / items.length, "scaling item " + i + " of " + items.length);
+                if (i % 10 === 0 && i > 0) {
+                    spreadProg(report, 0.45 * i / items.length,
+                               "scaling item " + i + "/" + items.length + " (" + className(items[i]) + ")");
                 }
                 try {
                     items[i].transform(
@@ -979,8 +1041,9 @@
 
         spreadProg(report, 0.55, "placing " + items.length + " item(s)");
         for (i = 0; i < items.length; i++) {
-            if (i % 25 === 0 && i > 0) {
-                spreadProg(report, 0.55 + 0.45 * i / items.length, "placing item " + i + " of " + items.length);
+            if (i % 10 === 0 && i > 0) {
+                spreadProg(report, 0.55 + 0.45 * i / items.length,
+                           "placing item " + i + "/" + items.length + " (" + className(items[i]) + ")");
             }
             if (!offs[i]) continue;
             var tgtX = trimX + s * offs[i][0];
@@ -1122,16 +1185,12 @@
             // ------- style definitions -------
             if (cfg.doStyles && s !== 1) {
                 PROG.phase(60, 70, "Scaling style definitions...");
-                PROG.step(0.0, "Paragraph styles");
-                var nP = scaleStyleCollection(doc.allParagraphStyles, PARA_PROPS, s);
-                PROG.step(0.4, "Character styles");
-                var nC = scaleStyleCollection(doc.allCharacterStyles, TEXT_PROPS, s);
-                PROG.step(0.6, "Object styles");
-                var nO = scaleObjectStyles(doc, s);
-                PROG.step(0.8, "Table and cell styles");
+                var nP = scaleStyleCollection(doc.allParagraphStyles, PARA_PROPS, s, "Paragraph style", 0.0, 0.3);
+                var nC = scaleStyleCollection(doc.allCharacterStyles, TEXT_PROPS, s, "Character style", 0.3, 0.45);
+                var nO = scaleObjectStyles(doc, s, 0.45, 0.8);
                 var nT = 0, nCe = 0;
-                try { nT = scaleStyleCollection(doc.allTableStyles, TABLE_PROPS, s); } catch (e) {}
-                try { nCe = scaleStyleCollection(doc.allCellStyles, CELL_PROPS, s); } catch (e) {}
+                try { nT = scaleStyleCollection(doc.allTableStyles, TABLE_PROPS, s, "Table style", 0.8, 0.88); } catch (e) {}
+                try { nCe = scaleStyleCollection(doc.allCellStyles, CELL_PROPS, s, "Cell style", 0.88, 0.95); } catch (e) {}
                 PROG.step(0.95, "Text defaults");
                 try { applyProps(doc.textDefaults, snapshotProps(doc.textDefaults, PARA_PROPS), s); } catch (e) {}
                 summary.push("Styles scaled — para: " + nP + ", char: " + nC +
@@ -1173,7 +1232,10 @@
             if (!effectsPrefOK && s !== 1) {
                 PROG.phase(89, 90, "Scaling effects manually (older InDesign)...");
                 var allIt = doc.allPageItems;
-                for (i = 0; i < allIt.length; i++) scaleEffectsOn(allIt[i], s);
+                for (i = 0; i < allIt.length; i++) {
+                    if (i % 10 === 0) PROG.step(i / allIt.length, "Item " + (i + 1) + "/" + allIt.length + " (" + className(allIt[i]) + ")");
+                    scaleEffectsOn(allIt[i], s);
+                }
                 if (cfg.doParents) {
                     for (i = 0; i < doc.masterSpreads.length; i++) {
                         try {
@@ -1191,8 +1253,9 @@
                 var bake = function (items, f0, f1) {
                     var n = 0;
                     for (var k = 0; k < items.length; k++) {
-                        if (k % 50 === 0) {
-                            PROG.step(f0 + (f1 - f0) * k / items.length, "Item " + k + " of " + items.length);
+                        if (k % 10 === 0) {
+                            PROG.step(f0 + (f1 - f0) * k / items.length,
+                                      "Item " + (k + 1) + "/" + items.length + " (" + className(items[k]) + ")");
                         }
                         if (isGraphicClass(items[k])) continue; // keep placed-image scale % meaningful
                         try { items[k].redefineScaling(); n++; } catch (e) {}
